@@ -11,10 +11,10 @@ This repository is the official PyTorch implementation of "SliderQuant: Accurate
 
 ![SliderQuant overview](asserts/main-fig.png)
 
-We propose SliderQuant with two core designs:
+We propose a new PTQ framework termed Sliding-layer Quantization (SliderQuant) consisting of two key components:
 
-- Inter-layer sliding quantization adapts the window shape across shallow, intermediate, and deep layers.
-- Intra-layer sliding quantization progressively quantizes layers inside the current window.
+- Inter-layer sliding quantization couples three types of sliding window designs to address the varying quantization sensitivity of shallow, intermediate and deep layers of any pre-trained LLMs.
+- Intra-layer sliding quantization quantizes layers inside the current slidning window in an incremental manner.
 
 ## Table Of Contents
 
