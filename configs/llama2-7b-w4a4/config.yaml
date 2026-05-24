@@ -18,7 +18,6 @@ load_rotate_model_path: ./rotate_models/llama2-7B-rotate.pth  # Load the rotated
 num_layer: 2          # middle sliding window size
 sliding_layer: 1      # middle sliding stride
 fill_window_size: 4   # progressive sliding size
-littlt_bs_round: 2,3,-3,-4
 
 
 

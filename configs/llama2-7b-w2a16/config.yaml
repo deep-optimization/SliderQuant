@@ -15,7 +15,6 @@ test_datasets: wikitext2,c4
 num_layer: 2     # middle sliding window size
 sliding_layer: 1  # middle sliding stride
 fill_window_size: 4   # progressive sliding size
-littlt_bs_round: 2,3,-3,-4
 
 
 # lora
