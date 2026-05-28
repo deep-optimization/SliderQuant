@@ -104,7 +104,6 @@ sliderquant/
 ```bash
 result_dir=configs/llama2-7b-w2a16
 
-result_dir=${exp_id}
 GPU_NUM=1
 port=29507
 THRESHOLD=0.05
