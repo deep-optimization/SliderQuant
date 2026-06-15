@@ -206,12 +206,18 @@ def get_quant_model(args):
         args.net = args.model.split('/')[-1]
     args.model_family = args.net.split('-')[0]
     lm = LMClass(args)
-    if args.load_rotate_model_path is not None and rank == 0:
-        os.makedirs(os.path.dirname(args.load_rotate_model_path),exist_ok=True)
-        if os.path.exists(args.load_rotate_model_path) is False:
-            save_dict = get_rotate_model(lm.model,args.load_rotate_model_path)
-            lm = LMClass(args)
-        save_dict = torch.load(args.load_rotate_model_path)
+    if args.load_rotate_model_path is not None:
+        if rank == 0:
+            rotate_model_dir = os.path.dirname(args.load_rotate_model_path)
+            if rotate_model_dir:
+                os.makedirs(rotate_model_dir, exist_ok=True)
+            if os.path.exists(args.load_rotate_model_path) is False:
+                save_dict = get_rotate_model(lm.model,args.load_rotate_model_path)
+                lm = LMClass(args)
+                del save_dict
+        if args.use_ddp:
+            dist.barrier()
+        save_dict = torch.load(args.load_rotate_model_path, map_location="cpu")
         lm.model.load_state_dict(save_dict["model"])
         logger.info(f"load fp16 model from {args.load_rotate_model_path}")
         del save_dict
