@@ -1,0 +1,48 @@
+model: model_zoo/Llama-2-7b-hf
+wbits: 4 
+abits: 4
+epochs: 20
+use_bfloat16: true
+eval_ppl: true
+quant_mode: slider  # [fp16,slider,lora_only] slider is for W4A4, lora_only is for WXA16.
+batch_size: 3
+low_memory: true
+nsamples: 128        # the num pf calibration data
+calib_dataset: wikitext2       
+test_datasets: wikitext2,c4
+
+load_rotate_model_path: ./rotate_models/llama2-7B-rotate.pth  # Load the rotated FP16 model; if the file does not exist, a rotated model will be generated at the specified path. Applies only to weight-activation quantization.
+
+
+fill_window_size: 4   # 论文 Ls/Ld=4/4: shallow/deep 渐进滑窗
+
+# group layer
+num_layer: 4          # middle sliding window size
+sliding_layer: 2      # middle sliding stride
+
+
+
+
+
+
+# lora
+lora_rank: 4        # lora rank
+use_lora: true     # 默认
+
+
+# instraSliding
+quant_step: 2
+quant_rate: 0.5     
+
+
+# target generation and loss
+inference_batch_size: 4   # the batchsize in get training data
+fp16_act: false           # use fp_act to reduce cpu memory
+
+
+# optimizer
+scale_lr: 0.001    #learn scaling学习率
+lora_lr: 0.0001     # lora 学习率
+lwc_lr: 0.01       # lwc学习率
+warmup_ratio: 0.0  # warnup占总训练iter的比例，范围：[0.0,1.0]
+wd: 0.0

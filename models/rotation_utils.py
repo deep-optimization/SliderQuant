@@ -3,7 +3,7 @@ import typing
 from quantize import utils
 import transformers
 import tqdm, math
-from models.hadamard_utils import random_hadamard_matrix
+from models.hadamard_utils import random_hadamard_matrix, matmul_hadU, is_pow2
 from dataclasses import dataclass
 
 OPT_MODEL = transformers.models.opt.modeling_opt.OPTForCausalLM
@@ -259,6 +259,32 @@ def rotate_attention_output(layer, Q, model_type) -> None:
         b = W.bias.data.to(device=DEV, dtype=torch.float64)
         W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
 
+def apply_exact_had_to_linear(module, had_dim=-1, output=False):
+    """把(可能分块的) Hadamard 旋转吸收进 nn.Linear 权重 (QuaRot 风格)。
+    had_dim=-1: 对整维做 Hadamard; had_dim=K: 按 K 维分块做 (如 head_dim)。
+    output=False: 作用于输入维(weight 的列); output=True: 作用于输出维(weight 的行)。
+    """
+    assert isinstance(module, torch.nn.Linear)
+    dtype = module.weight.dtype
+    W = module.weight.data.to(device=DEV, dtype=torch.float64)
+    if had_dim == -1:
+        if output:
+            W = matmul_hadU(W.t()).t().contiguous()      # Hadamard on out_features
+        else:
+            W = matmul_hadU(W)                            # Hadamard on in_features
+    else:
+        assert is_pow2(had_dim), "分块 Hadamard 要求块大小为 2 的幂"
+        if output:
+            out_f, in_f = W.shape
+            W = W.t().contiguous().reshape(in_f, out_f // had_dim, had_dim)   # 按输出维分块
+            W = matmul_hadU(W).reshape(in_f, out_f).t().contiguous()
+        else:
+            out_f, in_f = W.shape
+            W = W.contiguous().reshape(out_f, in_f // had_dim, had_dim)       # 按输入维分块
+            W = matmul_hadU(W).reshape(out_f, in_f).contiguous()
+    module.weight.data = W.to(device="cpu", dtype=dtype)
+
+
 def rotate_mlp_input(layer, Q, model_type):
     # Rotate the MLP input weights.
     if model_type == LLAMA_MODEL or  model_type == QWEN_MODEL:
@@ -286,7 +312,20 @@ def rotate_mlp_output(layer, Q, model_type,add_online_rotate=True):
     if W.bias is not None:
         b = W.bias.data.to(device=DEV, dtype=torch.float64)
         W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+    if add_online_rotate:
+        # SliderQuant+: down_proj 输入维 (intermediate) 的在线 Hadamard，权重侧吸收逆变换。
+        # 配套 int_llama_layer MLP forward 中对激活做 matmul_hadU。
+        apply_exact_had_to_linear(W, had_dim=-1, output=False)
 
+
+def rotate_attention_v_o(layer, head_dim, model_type):
+    # SliderQuant+: v-o 的 head_dim Hadamard，可完全吸收 (Hadamard 穿过 attention)，forward 无需改动。
+    if model_type == LLAMA_MODEL or model_type == QWEN_MODEL:
+        v_proj, o_proj = layer.self_attn.v_proj, layer.self_attn.o_proj
+    else:
+        raise ValueError(f'Unknown model type {model_type}')
+    apply_exact_had_to_linear(v_proj, had_dim=head_dim, output=True)   # v 输出维分块 Hadamard
+    apply_exact_had_to_linear(o_proj, had_dim=head_dim, output=False)  # o 输入维分块 Hadamard (抵消)
 
 
 def rotate_head(model, Q: torch.Tensor) -> None:
@@ -316,10 +355,12 @@ def rotate_model(model, args,add_online_rotate=True):
         rotate_attention_output(layers[idx], Q, model_type)
         rotate_mlp_input(layers[idx], Q, model_type)
         rotate_mlp_output(layers[idx], Q, model_type,add_online_rotate)
+        if add_online_rotate:
+            rotate_attention_v_o(layers[idx], head_dim, model_type)
 
 
 
-def get_rotate_model(model,save_path):
+def get_rotate_model(model,save_path,add_online_rotate=False):
     @dataclass
     class parm():
         rotate_mode:str
@@ -329,7 +370,7 @@ def get_rotate_model(model,save_path):
     model.to("cpu")
     model.eval()
     fuse_layer_norms(model)
-    rotate_model(model, args,add_online_rotate=False)
+    rotate_model(model, args,add_online_rotate=add_online_rotate)
     save_dict = {}
     save_dict["model"] = model.state_dict()
     torch.save(save_dict, args.save_qmodel_path)

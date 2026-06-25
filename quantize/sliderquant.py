@@ -106,7 +106,10 @@ def train_one_round(r,epochs,sub_layers,layer_id_list,qdataset,cur_epochs,optimi
         
     logger.info(f"Accumulated_loss_num is {Accumulated_loss_num}")
 
-    sub_layers.module.module.train() # 确保开启训练模型
+    if args.use_ddp is True:
+        sub_layers.module.module.train() # 确保开启训练模型
+    else:
+        sub_layers.train() # 非DDP路径：sub_layers 为 ModuleList
 
     for e in range(epochs):
         if args.use_ddp is True:
@@ -183,7 +186,8 @@ def train_one_round(r,epochs,sub_layers,layer_id_list,qdataset,cur_epochs,optimi
                     import ipdb;ipdb.set_trace()
                 assert math.isfinite(loss.item()),"Loss is NAN, stopping training!"
             if args.grad_clip is not None:
-                total_norm = torch.nn.utils.clip_grad_norm_(sub_layers.module.module.parameters(), max_norm=args.grad_clip)
+                clip_params = (sub_layers.module.module if args.use_ddp is True else sub_layers).parameters()
+                total_norm = torch.nn.utils.clip_grad_norm_(clip_params, max_norm=args.grad_clip)
                 # logger.info(f"Gradient norm: {total_norm:.4f} Max norm: {args.grad_clip}")
             
             optimizer.step()
@@ -609,8 +613,9 @@ def sliderquant(
             
 
             if args.layers_assigned_gpu is not None:
-                devs = [torch.device(f"cuda:{gpu}") for gpu in args.layers_assigned_gpu.split(",")]
-                assert len(devs) == len(sub_layers), "layers_assigned_gpu number is not equal to layer number!"
+                all_devs = [torch.device(f"cuda:{gpu}") for gpu in args.layers_assigned_gpu.split(",")]
+                # 适配可变窗口大小(fill_window_size 下窗口为 1..num_layer)：层循环分配到卡
+                devs = [all_devs[i % len(all_devs)] for i in range(len(sub_layers))]
                 sub_layers = to_dev(sub_layers, devs)  #mutil-gpu
             else:
                 devs = [dev] * len(sub_layers)

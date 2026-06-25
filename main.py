@@ -147,6 +147,7 @@ def parse_arguments():
     )
     parser.add_argument("--net", type=str, default=None, choices=net_choices, help="model family name used for layer handling and cache naming")
     parser.add_argument("--act_symmetric", default=False, action="store_true", help="use symmetric activation quantization")
+    parser.add_argument("--online_had", default=False, action="store_true", help="SliderQuant+: enable online Hadamard rotation (down_proj input + q/k); requires a rotated model generated with the same flag")
 
     args = parser.parse_args()
 
@@ -212,7 +213,7 @@ def get_quant_model(args):
             if rotate_model_dir:
                 os.makedirs(rotate_model_dir, exist_ok=True)
             if os.path.exists(args.load_rotate_model_path) is False:
-                save_dict = get_rotate_model(lm.model,args.load_rotate_model_path)
+                save_dict = get_rotate_model(lm.model,args.load_rotate_model_path,add_online_rotate=args.online_had)
                 lm = LMClass(args)
                 del save_dict
         if args.use_ddp:

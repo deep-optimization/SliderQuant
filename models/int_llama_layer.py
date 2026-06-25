@@ -19,7 +19,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBl
 
 from quantize.int_linear_lora import LoRAQuantLinear
 
-from models.hadamard_utils import random_hadamard_matrix
+from models.hadamard_utils import random_hadamard_matrix, matmul_hadU
 
 from quantize.utils import cleanup_memory
 
@@ -79,8 +79,12 @@ class QuantLlamaMLP(nn.Module):
 
 
     def forward(self, x):
-
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        h = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        if getattr(self.args, "online_had", False):
+            # SliderQuant+: down_proj 输入的在线 Hadamard (不可吸收，因前面是 SwiGLU 非线性)。
+            # 在 down_proj 内部激活量化之前打散 outlier；权重侧已离线吸收逆变换。
+            h = matmul_hadU(h.contiguous())
+        return self.down_proj(h)
 
 def get_quant_moe_mlp(org_module: nn.Module,args,config,use_lora,lora_attr):
     if args.quant_gate is True or args.update_gate is True:
@@ -289,6 +293,12 @@ class QuantLlamaAttention(nn.Module):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
         
 
+
+        if getattr(self.args, "online_had", False):
+            # SliderQuant+: q/k 的 head_dim 在线 Hadamard (不可吸收，因 RoPE 非线性)。
+            # q、k 同时旋转，QK^T 不变 (H 正交)，但量化的 k 在 Hadamard 域 outlier 被打散。
+            query_states = matmul_hadU(query_states.contiguous())
+            key_states = matmul_hadU(key_states.contiguous())
 
         query_states = self.qkt_matmul.quant_x1(query_states) # dont quant q
         key_states = self.qkt_matmul.quant_x2(key_states)

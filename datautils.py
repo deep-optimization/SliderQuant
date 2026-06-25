@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import random
 
-c4_path = "/SliderQuant/datasets_local/c4"
+c4_path = "./datasets_local/c4"
 
 def set_seed(seed):
     np.random.seed(seed)
