@@ -40,7 +40,7 @@ def evaluate(lm, args, logger):
             lm.model.lm_head.to(output_device)
         else:
             raise NotImplementedError("Only support for llama/vicuna/qwen multigpu now")
-        
+
     elif args.parallelize:
         balanced_mem = get_balanced_memory(
             lm.model,
@@ -54,7 +54,7 @@ def evaluate(lm, args, logger):
             no_split_module_classes=["LlamaDecoderLayer","QuantLlamaDecoderLayer","Qwen3MoeDecoderLayer"]
         )
         lm.model = dispatch_model(lm.model,device_map=device_map)
-        
+
     else:
         if "llama" in args.net.lower() or "vicuna" in args.net.lower() or "qwen" in args.net.lower():
             lm.model = lm.model.to(lm.device)
@@ -62,7 +62,7 @@ def evaluate(lm, args, logger):
             raise NotImplementedError("Only support for llama/vicuna/qwen single gpu now")
 
 
-    
+
     if args.eval_ppl:
         logger.info(f"model seqlen is {lm.seqlen}")
         datasets = args.test_datasets.split(",")
@@ -121,15 +121,15 @@ def evaluate(lm, args, logger):
             logger.info(f'{dataset} : {ppl.item()}')
             lm.model.config.use_cache = use_cache
             results[dataset] = ppl.item()
-    
+
     if args.tasks != "":
         args.tasks = args.tasks.split(",")
         import lm_eval
         from lm_eval import utils as lm_eval_utils
         from lm_eval.api.registry import ALL_TASKS
         from lm_eval.models.huggingface import HFLM
-        print(f"use lm_eval in {lm_eval}")  
-        
+        print(f"use lm_eval in {lm_eval}")
+
         task_manager = lm_eval.tasks.TaskManager(include_path="./datasets_local/lm_eval_configs/tasks", include_defaults=True)
         hflm = HFLM(pretrained=lm.model,tokenizer=lm.tokenizer, batch_size=args.lm_eval_batch_size)
         t_results = lm_eval.simple_evaluate(hflm, tasks=args.tasks, batch_size=args.lm_eval_batch_size,task_manager=task_manager)['results']
@@ -141,7 +141,7 @@ def evaluate(lm, args, logger):
         pprint(metric_vals)
         if args.eval_ppl is True:
             metric_vals.update(results)
-        
+
         reported_metric_vals = {}
         for k,v in metric_vals.items():
             if "mmlu" in k:
@@ -149,12 +149,12 @@ def evaluate(lm, args, logger):
                     reported_metric_vals[k] = v
             else:
                 reported_metric_vals[k] = v
-            
+
         import pandas as pd
         if os.path.exists(f"{args.output_dir}/results.csv"):
             df = pd.read_csv(f"{args.output_dir}/results.csv")
             new_df = pd.DataFrame(reported_metric_vals,index=[0])
-            df[new_df.columns] = new_df  
+            df[new_df.columns] = new_df
         else:
             df = pd.DataFrame(reported_metric_vals,index=[0])
         if args.eval_ppl:
@@ -162,17 +162,17 @@ def evaluate(lm, args, logger):
         else:
              new_columns = []
         new_columns += args.tasks
-        
+
         if len(args.tasks) >= 5:
             df["avg-5"] = df[['piqa','arc_easy', 'arc_challenge','hellaswag', 'winogrande']].mean(axis=1)
         if len(args.tasks) >= 6:
             df["avg-6"] = df[['piqa','arc_easy', 'arc_challenge','hellaswag', 'winogrande', 'boolq']].mean(axis=1)
         if 'mmlu' in args.tasks and len(args.tasks) >= 7:
             df["avg-7"] = df[['piqa','arc_easy', 'arc_challenge','hellaswag', 'winogrande', 'boolq','mmlu']].mean(axis=1)
-            
+
         logger.info(df)
         df.to_csv(f"{args.output_dir}/results.csv",index=False)
-    
+
     model = lm.model
     if "llama" in args.net.lower() or "vicuna" in args.net.lower() or "qwen" in args.net.lower():
         model.model.embed_tokens = model.model.embed_tokens.cpu()
@@ -194,7 +194,7 @@ def get_slider_parameters(sub_layers, use_list=["scale","alpha","shift"]):
                 params.append(m)
                 # print(n)
     # print(params)
-    return iter(params)  
+    return iter(params)
 
 def get_lwc_parameters(sub_layers):
     params = []
@@ -204,7 +204,16 @@ def get_lwc_parameters(sub_layers):
         for n, m in sub_layers[sub_layer_idx].named_parameters():
             if n.find('bound_factor') > -1:
                 params.append(m)
-    return iter(params)  
+    return iter(params)
+
+
+def get_catq_parameters(sub_layers):
+    return (
+        parameter
+        for layer in sub_layers
+        for name, parameter in layer.named_parameters()
+        if name.endswith(("raw_mu", "raw_scale", "raw_round"))
+    )
 
 def try_delete_object(object,logger,name=None):
     try:
@@ -247,15 +256,21 @@ def slider_state_dict(model, destination=None, prefix='', keep_vars=False):
     if destination is None:
         destination = OrderedDict()
     for name, param in model.named_parameters():
-        if name.find('smooth') > -1 or name.find('bound_factor') > -1 or name.find('lora_') > -1 or name.find('Q_') > -1 :
-            destination[prefix + name] = param if keep_vars else param.detach()
+        if (
+            name.find("smooth") > -1
+            or name.find("bound_factor") > -1
+            or name.find("lora_") > -1
+            or name.find("Q_") > -1
+            or name.endswith(("raw_mu", "raw_scale", "raw_round"))
+        ):
+            destination[prefix + name] = (
+                param if keep_vars else param.detach().cpu().clone()
+            )
     return destination
 
 def register_scales_and_zeros(model):
     for name, module in model.named_modules():
         if isinstance(module, QuantLinear):
             module.weight_quantizer.register_scales_and_zeros()
-
- 
 
 

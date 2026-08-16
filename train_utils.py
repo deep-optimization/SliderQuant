@@ -3,10 +3,30 @@ from collections import OrderedDict
 import torch
 
 from quantize.utils import register_scales_and_zeros
+from quantize.catq import CATQQuantizer
 from quantize.int_linear_lora import LoRALayer, LoRAQuantLinear
 from quantize.int_linear import QuantLinear
 from tqdm import tqdm
 from copy import deepcopy
+
+
+def load_catq_state_dict(layer, state):
+    expected = {
+        name
+        for name, _ in layer.named_parameters()
+        if name.endswith(("raw_mu", "raw_scale", "raw_round"))
+        or "lora_A." in name
+        or "lora_B." in name
+    }
+    actual = set(state)
+    assert actual == expected, (
+        f"CAT-Q checkpoint keys do not match the configured layer; "
+        f"missing={sorted(expected - actual)}, "
+        f"unexpected={sorted(actual - expected)}"
+    )
+    incompatible = layer.load_state_dict(state, strict=False)
+    assert not incompatible.unexpected_keys
+
 
 def get_lws_parameters(sub_layers, round_idx):
     normal_params = []
@@ -43,10 +63,10 @@ def init_model(config,layers,args,DecoderLayer,model_attr,logger,dev,layer_id_li
     dtype = model_attr["dtype"]
 
     bits = args.weight_quant_params["n_bits"]
-    
+
     if layer_id_list is None:
         layer_id_list = list(range(len(layers)))
-    
+
     for layer_id in layer_id_list:
 
         args.weight_quant_params["n_bits"] = bits
@@ -70,7 +90,7 @@ def init_model(config,layers,args,DecoderLayer,model_attr,logger,dev,layer_id_li
         )
 
         qlayer.let = args.let
-        use_shift = True 
+        use_shift = True
         if is_llama or args.abits == 16:
             use_shift = False                   # deactivate channel-wise shifting for llama model and weight-only quantization
         if args.let and args.quant_mode_layer_list[layer_id] not in ["fp16","lora_only"]:
@@ -88,25 +108,30 @@ def init_model(config,layers,args,DecoderLayer,model_attr,logger,dev,layer_id_li
                             shift =  torch.zeros(module.in_features,device=dev, dtype=dtype)
                             logger.info(f"init slider_parameters from in layer_{layer_id} {pairs[key]} with ones!")
                             # import ipdb; ipdb.set_trace()
-                            if pairs[key] == "out" and args.gqa_scales == "copy":  # modify scale  for GQA   
+                            if pairs[key] == "out" and args.gqa_scales == "copy":  # modify scale  for GQA
                                 scale = scale.view(-1,qlayer.self_attn.num_key_value_groups,qlayer.self_attn.head_dim).mean(dim=1).view(-1)
                                 shift = shift.view(-1,qlayer.self_attn.num_key_value_groups,qlayer.self_attn.head_dim).mean(dim=1).view(-1)
                             qlayer.register_parameter(f"{pairs[key]}_smooth_shift",torch.nn.Parameter(shift))
                             qlayer.register_parameter(f"{pairs[key]}_smooth_scale",torch.nn.Parameter(scale))
-        
+
         if args.resume and (layer_id < args.resume_layers_num or args.test_mode):
-            try:
+            if layer_id not in slider_parameters:
+                assert not args.test_mode, f"resume checkpoint has no layer {layer_id}"
+            else:
                 layer_slider_parameters = slider_parameters[layer_id]
                 if args.wo_lwc:
-                    # import ipdb;ipdb.set_trace()
-                    layer_slider_parameters = { key:layer_slider_parameters[key] for key in layer_slider_parameters.keys() if "bound_factor" not in key}
-                qlayer.load_state_dict(layer_slider_parameters, strict=False)
+                    layer_slider_parameters = {
+                        key: value
+                        for key, value in layer_slider_parameters.items()
+                        if "bound_factor" not in key
+                    }
+                if args.quant_mode_layer_list[layer_id] == "catq":
+                    load_catq_state_dict(qlayer, layer_slider_parameters)
+                else:
+                    qlayer.load_state_dict(layer_slider_parameters, strict=False)
                 logger.info(f"load slider_parameters from {args.resume} in layer{layer_id} successfully!")
-            except Exception as e:
-                import ipdb;ipdb.set_trace()
-                logger.info(f"load state occurs {e}, skip!")
         if args.test_mode is True:
-            qlayer.float() 
+            qlayer.float()
         layers[layer_id] = qlayer
     return layers
 
@@ -121,41 +146,61 @@ def add_new_module(name, original_module, added_module):
                 mod_ = getattr(mod_, levels[l_idx])
         setattr(mod_, levels[-1], added_module)
     else:
-        setattr(original_module, name, added_module)    
+        setattr(original_module, name, added_module)
 
 def get_named_linears(module):
     return {name: m for name, m in module.named_modules() if isinstance(m, QuantLinear)}
+
+
+def make_causal_mask(token_mask, dtype, device):
+    token_mask = token_mask.to(device=device, dtype=torch.bool)
+    sequence_length = token_mask.shape[-1]
+    minimum = torch.finfo(dtype).min
+    causal = torch.triu(
+        torch.full(
+            (sequence_length, sequence_length),
+            minimum,
+            dtype=dtype,
+            device=device,
+        ),
+        diagonal=1,
+    )
+    causal = causal.unsqueeze(0).unsqueeze(0).expand(len(token_mask), 1, -1, -1).clone()
+    return causal.masked_fill(~token_mask[:, None, None, :], minimum)
 
 
 
 @torch.no_grad()
 def model_to_inference_mode(layers, args,dtype,dev="cpu"):
     for layer_id in tqdm(range(len(layers))):
-        qlayer = layers[layer_id].to(dev)   
+        qlayer = layers[layer_id].to(dev)
         # qlayer.to(dtype)
         qlayer.clear_temp_variable()
+        if args.quant_mode_layer_list[layer_id] == "catq":
+            qlayer.set_catq_progress(1.0)
 
         qlayer.eval_mode = False if qlayer.quant_mode == "fp16" else True
 
             # uptate to quant mode
         if args.test_mode is True:
             if args.weight_merge is True and args.quant_mode_layer_list[layer_id] not in ["fp16","direct"]:
-                qlayer.update_quant_mode("weight_merge",args=args) 
+                qlayer.update_quant_mode("weight_merge",args=args)
             else:
                 qlayer.update_quant_mode(args.quant_mode_layer_list[layer_id],args=args)
         else:
             qlayer.update_quant_mode(args.quant_mode_layer_list[layer_id],args=args)
         layers[layer_id] = qlayer.to("cpu")
-        
-    return layers 
+
+    return layers
 
 
 
 
 
-def obtain_teacher_output(sub_layers, inp, attention_mask, position_ids,position_embeddings,args,devs=None):
+def obtain_teacher_output(sub_layers, inp, token_mask, position_ids,position_embeddings,args,devs=None):
     # if args.low_memory is True:
     #     inp = inp.to(devs[0])
+    attention_mask = make_causal_mask(token_mask, inp.dtype, devs[0])
     for sub_layer_idx in range(len(sub_layers)):
         # import ipdb;ipdb.set_trace()
         if args.teach_model is None:  # 独立加载fp16模型
@@ -163,8 +208,7 @@ def obtain_teacher_output(sub_layers, inp, attention_mask, position_ids,position
         if sub_layer_idx == 0:
             if inp.device != devs[sub_layer_idx]:
                 inp = inp.to(devs[sub_layer_idx])
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(devs[sub_layer_idx])
+                attention_mask = attention_mask.to(devs[sub_layer_idx])
                 if position_ids is not None:
                     position_ids = position_ids.to(devs[sub_layer_idx])
                     position_embeddings = tuple([position_embeddings[0].to(devs[sub_layer_idx]),position_embeddings[1].to(devs[sub_layer_idx])])
@@ -174,8 +218,7 @@ def obtain_teacher_output(sub_layers, inp, attention_mask, position_ids,position
         else:
             if out.device != devs[sub_layer_idx]:
                 out = out.to(devs[sub_layer_idx])
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(devs[sub_layer_idx])
+                attention_mask = attention_mask.to(devs[sub_layer_idx])
                 if position_ids is not None:
                     position_ids = position_ids.to(devs[sub_layer_idx])
                     position_embeddings = tuple([position_embeddings[0].to(devs[sub_layer_idx]),position_embeddings[1].to(devs[sub_layer_idx])])
@@ -190,21 +233,19 @@ def obtain_teacher_output(sub_layers, inp, attention_mask, position_ids,position
     return out
 
 class SubLayer(torch.nn.Module):
-    def __init__(self,sub_layers,quant_mode_sub_layer_list,attention_mask,position_ids,position_embeddings,args):
+    def __init__(self,sub_layers,quant_mode_sub_layer_list,position_ids,position_embeddings,args):
         super().__init__()
         self.module = sub_layers
         self.quant_mode_sub_layer_list = quant_mode_sub_layer_list
-        self.attention_mask = attention_mask
         self.position_ids = position_ids
         self.position_embeddings = position_embeddings
         self.args = args
-    
-    def forward(self,x):
+
+    def forward(self, x, token_mask):
         dev = x.device
+        attention_mask = make_causal_mask(token_mask, x.dtype, dev)
         for sub_layer_idx in range(len(self.module)):
-            self.module[sub_layer_idx].update_quant_mode(self.quant_mode_sub_layer_list[sub_layer_idx],args=self.args)  
-            if self.attention_mask is not None:
-                attention_mask = self.attention_mask.to(dev)[:len(x)]
+            self.module[sub_layer_idx].update_quant_mode(self.quant_mode_sub_layer_list[sub_layer_idx],args=self.args)
             if self.position_ids is not None:
                 position_ids = self.position_ids.to(dev)
                 position_embeddings = tuple([self.position_embeddings[0].to(dev),self.position_embeddings[1].to(dev)])
@@ -219,18 +260,18 @@ class SubLayer(torch.nn.Module):
                     position_ids=position_ids,position_embeddings=position_embeddings,
                 )[0]
         return out
-        
 
 
 
-def obtain_studnet_output(sub_layers,quant_mode_sub_layer_list, inp, attention_mask, position_ids,position_embeddings, args,devs=None,return_gpu=False):
+
+def obtain_studnet_output(sub_layers,quant_mode_sub_layer_list, inp, token_mask, position_ids,position_embeddings, args,devs=None,return_gpu=False):
+    attention_mask = make_causal_mask(token_mask, inp.dtype, devs[0])
     for sub_layer_idx in range(len(sub_layers)):
-        sub_layers[sub_layer_idx].update_quant_mode(quant_mode_sub_layer_list[sub_layer_idx],args=args)  
+        sub_layers[sub_layer_idx].update_quant_mode(quant_mode_sub_layer_list[sub_layer_idx],args=args)
         if sub_layer_idx == 0:
             if inp.device != devs[sub_layer_idx]:
                 inp = inp.to(devs[sub_layer_idx])
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(devs[sub_layer_idx])
+                attention_mask = attention_mask.to(devs[sub_layer_idx])
                 if position_ids is not None:
                     position_ids = position_ids.to(devs[sub_layer_idx])
                     position_embeddings = tuple([position_embeddings[0].to(devs[sub_layer_idx]),position_embeddings[1].to(devs[sub_layer_idx])])
@@ -242,8 +283,7 @@ def obtain_studnet_output(sub_layers,quant_mode_sub_layer_list, inp, attention_m
             #     print("debuf!")
             if out.device != devs[sub_layer_idx]:
                 out = out.to(devs[sub_layer_idx])
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(devs[sub_layer_idx])
+                attention_mask = attention_mask.to(devs[sub_layer_idx])
                 if position_ids is not None:
                     position_ids = position_ids.to(devs[sub_layer_idx])
                     position_embeddings = tuple([position_embeddings[0].to(devs[sub_layer_idx]),position_embeddings[1].to(devs[sub_layer_idx])])
@@ -255,7 +295,7 @@ def obtain_studnet_output(sub_layers,quant_mode_sub_layer_list, inp, attention_m
             )[0]
             # print("end debug")
     if args.low_memory is True and return_gpu is False:
-        out = out.to("cpu")    
+        out = out.to("cpu")
     return out
 
 
@@ -306,6 +346,11 @@ def to_float(sub_layers,dtype):
 def to_half(sub_layers,dtype):
     with torch.no_grad():
         for sub_layer_idx in range(len(sub_layers)):
+            if any(
+                isinstance(module, CATQQuantizer)
+                for module in sub_layers[sub_layer_idx].modules()
+            ):
+                continue
             sub_layers[sub_layer_idx] = sub_layers[sub_layer_idx].to(dtype)
     return sub_layers
 
