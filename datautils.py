@@ -1,11 +1,24 @@
 import pdb
+import hashlib
+import json
+import os
+from pathlib import Path
 from transformers import AutoTokenizer
 from datasets import load_dataset
 import numpy as np
 import torch
 import random
+from safetensors.torch import load_file
 
-c4_path = "/SliderQuant/datasets_local/c4"
+c4_path = os.environ.get("SLIDERQUANT_C4_PATH", "datasets_local/c4")
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 def set_seed(seed):
     np.random.seed(seed)
@@ -21,7 +34,7 @@ def get_wikitext2(nsamples, seed, seqlen, model):
     trainenc = tokenizer("\n\n".join(traindata['text']), return_tensors='pt')
     testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
     print(f"wikitext train total tokens:{trainenc.input_ids.shape[1]}")
-    
+
     random.seed(seed)
     trainloader = []
     for _ in range(nsamples):
@@ -81,13 +94,79 @@ def get_c4(nsamples, seed, seqlen, model,from_start=False):
         valenc.append(tmp.input_ids[:, i:j])
     valenc = torch.hstack(valenc)
 
-    return trainloader, valenc 
+    return trainloader, valenc
+
+
+def get_ayot(manifest_path, nsamples, seqlen, subset_path=None):
+    manifest_path = Path(manifest_path)
+    manifest = json.loads(manifest_path.read_text())
+    checksums_path = manifest_path.parent / manifest["sha256sums_file"]
+    assert sha256_file(checksums_path) == manifest["sha256sums_sha256"]
+    checksums = {
+        name: digest
+        for digest, name in (
+            line.split("  ", 1) for line in checksums_path.read_text().splitlines()
+        )
+    }
+    assert checksums == manifest["files"]
+
+    tokenized = manifest["tokenized"]
+    assert tokenized["seq_len"] == seqlen
+    assert nsamples <= tokenized["rows"]
+
+    input_ids = []
+    attention_masks = []
+    for shard_info in tokenized["shards"]:
+        relative_path = shard_info["file"]
+        shard_path = manifest_path.parent / relative_path
+        assert sha256_file(shard_path) == checksums[relative_path]
+        shard = load_file(shard_path)
+        input_ids.append(shard["input_ids"])
+        attention_masks.append(shard["attention_mask"])
+
+    input_ids = torch.cat(input_ids)
+    attention_masks = torch.cat(attention_masks)
+    if subset_path is not None:
+        subset_path = Path(subset_path)
+        assert sha256_file(subset_path) == checksums[subset_path.name]
+        subset = json.loads(subset_path.read_text())
+        assert subset["artifact_id"] == manifest["artifact_id"]
+        assert subset["seq_len"] == seqlen
+        assert subset["rows"] == nsamples == len(subset["samples"])
+        indexes = torch.tensor(
+            [sample["global_row"] for sample in subset["samples"]], dtype=torch.long
+        )
+        assert len(indexes.unique()) == nsamples
+        assert indexes.min() >= 0 and indexes.max() < tokenized["rows"]
+        input_ids = input_ids[indexes]
+        attention_masks = attention_masks[indexes]
+    else:
+        input_ids = input_ids[:nsamples]
+        attention_masks = attention_masks[:nsamples]
+    assert input_ids.shape == attention_masks.shape == (nsamples, seqlen)
+
+    trainloader = []
+    for ids, mask in zip(input_ids, attention_masks):
+        ids = ids.unsqueeze(0)
+        mask = mask.unsqueeze(0)
+        target = ids.clone()
+        target[:, :-1] = -100
+        trainloader.append((ids, target, mask))
+    return trainloader, None
 
 
 
 def get_loaders(
     name, nsamples=128, seed=0, seqlen=2048, model='',args=None
 ):
+    if name == "ayot":
+        assert args is not None and args.calib_manifest is not None
+        return get_ayot(
+            args.calib_manifest,
+            nsamples,
+            seqlen,
+            subset_path=args.calib_subset,
+        )
 
     if 'wikitext2' in name:
         return get_wikitext2(nsamples, seed, seqlen, model)
