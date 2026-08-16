@@ -23,14 +23,33 @@ class LMClass(BaseLM):
 
         self.model_config = self.model_name
         config = AutoConfig.from_pretrained(
-            self.model_name, attn_implementation=args.attn_implementation,trust_remote_code=True
+            self.model_name,
+            revision=args.model_revision,
+            attn_implementation=args.attn_implementation,
+            trust_remote_code=False,
         )
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=False,legacy=False)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_name,
+            revision=args.model_revision,
+            use_fast=False,
+            legacy=False,
+            trust_remote_code=False,
+        )
+        self.tokenizer.padding_side = "right"
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         torch_dtype = torch.bfloat16 if args.use_bfloat16 is True else torch.float16
 
-        self.model = AutoModelForCausalLM.from_pretrained(self.model_name, config=config, device_map='cpu',torch_dtype=torch_dtype, trust_remote_code=True)
-        
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            revision=args.model_revision,
+            config=config,
+            device_map="cpu",
+            torch_dtype=torch_dtype,
+            trust_remote_code=False,
+        )
+
         self.seqlen = self.model.config.max_position_embeddings
         self.model.eval()
         self.vocab_size = self.tokenizer.vocab_size

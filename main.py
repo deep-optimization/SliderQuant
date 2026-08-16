@@ -41,6 +41,7 @@ net_choices = [
     "Llama-2-70b",
     "Llama-3-8B",
     "Qwen2.5-7B",
+    "qwen3",
 ]
 
 
@@ -50,6 +51,7 @@ def parse_arguments():
     parser.add_argument("--quant_gate", default=False, action="store_true", help="quantize MoE router gates")
     parser.add_argument("--update_gate", default=False, action="store_true", help="use 16-bit gate weights/activations when updating MoE router gates")
     parser.add_argument("--model", type=str, help="path or name of the base model to load")
+    parser.add_argument("--model_revision", type=str, default=None, help="immutable model and tokenizer revision")
     parser.add_argument("--teach_model", type=str, default=None, help="path or name of the teacher model used to generate distillation targets")
     parser.add_argument("--cache_dir", default="./cache", type=str, help="cache dir of dataset, leading to faster debug")
     parser.add_argument("--output_dir", default="../log/", type=str, help="direction of logging file")
@@ -81,7 +83,12 @@ def parse_arguments():
     )
     parser.add_argument("--quant_layer_list", type=str, default=None, help="automatically generated list of quantized layers; manual input is not supported")
     parser.add_argument("--use_lora", default=False, action="store_true", help="enable LoRA adaptation during quantization training")
-    parser.add_argument("--use_ddp", default=False, action="store_true", help="run training with DistributedDataParallel")
+    parser.add_argument(
+        "--use_ddp",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="run training with DistributedDataParallel",
+    )
     parser.add_argument("--use_down_scale", default=True, action="store_true", help="apply down-projection scaling smoothing when supported")
     parser.add_argument("--seqlen", type=int, default=2048, help="maximum sequence length for calibration and evaluation")
     parser.add_argument("--wo_lwc", default=False, action="store_true", help="disable learnable weight clipping")
@@ -101,6 +108,8 @@ def parse_arguments():
         # choices=["wikitext2", "ptb", "c4", "mix","pile"],
         help="Where to extract calibration data from.",
     )
+    parser.add_argument("--calib_manifest", type=str, default=None, help="sealed AYOT manifest path")
+    parser.add_argument("--calib_subset", type=str, default=None, help="optional AYOT subset manifest")
     parser.add_argument("--weight_merge", default=False, action="store_true", help="merge weights before evaluation or export")
     parser.add_argument("--resume_layers_num", type=int, default=None, help="number of layers to restore when resuming from a checkpoint")
     parser.add_argument("--start_round", type=int, default=0, help="starting round index when resuming training")
@@ -114,9 +123,14 @@ def parse_arguments():
     parser.add_argument("--wbits", type=int, default=4, help="weight bit-width")
     parser.add_argument("--abits", type=int, default=16, help="activation bit-width")
     parser.add_argument("--group_size", type=int, default=None, help="weight quantization group size; None means per-channel")
+    parser.add_argument("--init_round_thd", type=float, default=0.5, help="initial CAT-Q ternary threshold")
+    parser.add_argument("--progressive_ratio", type=float, default=0.8, help="fraction of CAT-Q updates using softened ternarization")
+    parser.add_argument("--s0", type=float, default=30.0, help="final CAT-Q soft-stage sharpness")
+    parser.add_argument("--learnable_factor_lr", type=float, default=1e-3, help="CAT-Q modulation-factor learning rate")
     parser.add_argument("--fill_window_size", type=int, default=None, help="window size used for progressive layer scheduling")
     parser.add_argument("--grad_clip", default=None, type=float, help="maximum gradient norm for clipping; None disables clipping")
     parser.add_argument("--loss_function", default="mse", type=str, choices=["mse", "huber"], help="loss function used for training rounds")
+    parser.add_argument("--huber_loss_max", default=1.0, type=float, help="maximum Huber delta across windows")
     parser.add_argument("--alpha", type=float, default=0.5, help="mixing factor for the current loss setup")
     parser.add_argument("--auto_lr_scale", default=True, action="store_true", help="automatically scale learning rates by the active quantization ratio")
     parser.add_argument("--scale_lr", type=float, default=5e-3, help="learning rate for learned scale parameters")
@@ -154,11 +168,14 @@ def parse_arguments():
         # 使用config文件来保存
         with open(args.config, "r") as f:
             config = yaml.safe_load(f)
+            known_keys = {action.dest for action in parser._actions}
+            unknown_keys = sorted(set(config) - known_keys)
+            assert not unknown_keys, f"unknown config keys: {unknown_keys}"
             for key, value in config.items():
                 if key not in ["debug","output_dir","weight_merge","test_mode","tasks","eval_ppl"]:
                     parser.set_defaults(**{key: value})
         args = parser.parse_args()
-    if args.output_dir:
+    if args.output_dir and int(os.environ.get("LOCAL_RANK", "0")) == 0:
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         args_dict = vars(args)
@@ -174,16 +191,16 @@ def setup_ddp():
     )
 
 def get_quant_model(args):
-   
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-    
-    if args.epochs > 0:
+
+    if args.epochs > 0 and args.quant_mode != "catq":
         assert args.lwc or args.let
-        
+
     if (args.wbits<16 and args.wbits>=8) or (args.abits<16 and args.abits>=8):
         args.deactive_amp = True
 
@@ -194,14 +211,14 @@ def get_quant_model(args):
         Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
     output_dir = Path(args.output_dir)
 
-    
+
     if args.use_ddp:
         rank = dist.get_rank()
     else:
         rank = 0
     logger = utils.create_logger(output_dir,dist_rank=rank)
     logger.info(args)
-    
+
     if args.net is None:
         args.net = args.model.split('/')[-1]
     args.model_family = args.net.split('-')[0]
@@ -233,6 +250,10 @@ def get_quant_model(args):
         "group_size": args.group_size,
         "lwc":args.lwc,
         "disable_zero_point": args.disable_zero_point,
+        "quant_mode": args.quant_mode,
+        "init_round_thd": args.init_round_thd,
+        "progressive_ratio": args.progressive_ratio,
+        "s0": args.s0,
     }
     args.act_quant_params = {
         "n_bits":  args.abits,
@@ -272,12 +293,21 @@ def get_quant_model(args):
 
     if args.wbits < 16 or args.abits <16 or args.quant_warp:
         logger.info("=== start quantization ===")
-        tick = time.time()     
+        tick = time.time()
         if args.seqlen != 2048:
             cache_dataloader = f'{args.cache_dir}/dataloader_{args.net}_{args.calib_dataset}_{args.nsamples}_{args.seqlen}.cache'
         else:
             cache_dataloader = f'{args.cache_dir}/dataloader_{args.net}_{args.calib_dataset}_{args.nsamples}.cache'
-        if os.path.exists(cache_dataloader):
+        if args.calib_dataset == "ayot":
+            dataloader, _ = get_loaders(
+                "ayot",
+                nsamples=args.nsamples,
+                seed=args.seed,
+                model=args.model,
+                seqlen=lm.seqlen,
+                args=args,
+            )
+        elif os.path.exists(cache_dataloader):
             dataloader = torch.load(cache_dataloader)
             logger.info(f"load calibration from {cache_dataloader}")
         else:
@@ -286,8 +316,8 @@ def get_quant_model(args):
             else:
                 calib_dataset_list = [args.calib_dataset]
             dataloader_list = []
-            
-            calib_nsamples_list = [ args.nsamples // len(calib_dataset_list) for _ in range(len(calib_dataset_list))] 
+
+            calib_nsamples_list = [ args.nsamples // len(calib_dataset_list) for _ in range(len(calib_dataset_list))]
 
             for calib_dataset,calib_nsamples in zip(calib_dataset_list,calib_nsamples_list):
                 _dataloader, _ = get_loaders(
@@ -303,7 +333,7 @@ def get_quant_model(args):
             for _dataloader in dataloader_list:
                 dataloader.extend(_dataloader)
             random.shuffle(dataloader)
-            torch.save(dataloader, cache_dataloader)    
+            torch.save(dataloader, cache_dataloader)
 
         if args.teach_model is not None:
             teach_lm = LMClass(args,args.teach_model)
@@ -322,17 +352,23 @@ def get_quant_model(args):
         logger.info(f"total use time: {(time.time() - tick)/3600:.2f}h")
     else:
         inps,infer_attention_mask,position_ids= None,None,None
-    
+
     return lm,logger,inps,infer_attention_mask,position_ids
-    
+
 def main():
     multiprocessing.set_start_method('spawn')
-    
+
     args = parse_arguments()
     if args.use_ddp is True:
         setup_ddp()
     lm,logger,_,_,_ = get_quant_model(args=args)
-        
+
+    if args.use_ddp:
+        dist.barrier()
+        if dist.get_rank() != 0:
+            dist.destroy_process_group()
+            return
+
     if args.export_model_path:
         logger.info("export model")
         ori_lm = LMClass(args)
@@ -344,7 +380,8 @@ def main():
 
     evaluate(lm, args,logger)
 
-    
+    if args.use_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

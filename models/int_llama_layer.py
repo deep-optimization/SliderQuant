@@ -18,6 +18,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBl
 
 
 from quantize.int_linear_lora import LoRAQuantLinear
+from quantize.catq import CATQQuantizer
 
 from models.hadamard_utils import random_hadamard_matrix
 
@@ -298,7 +299,7 @@ class QuantLlamaAttention(nn.Module):
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
-            attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
+            attn_weights = attn_weights.clamp_min(torch.finfo(attn_weights.dtype).min)
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = self.pv_matmul.quant_x1(attn_weights) # dont quant p
@@ -363,9 +364,9 @@ class QuantLlamaDecoderLayer(nn.Module):
         self.input_layernorm = SliderLlamaRMSNorm(ori_layer.input_layernorm,eps=ori_layer.input_layernorm.variance_epsilon)
         self.post_attention_layernorm = SliderLlamaRMSNorm(ori_layer.post_attention_layernorm,eps=ori_layer.post_attention_layernorm.variance_epsilon)
         self.eval_mode = False
-        self.quant_mode = quant_mode 
-        
-        assert self.quant_mode in ["slider","lora_only","fp16"],"only supprot quant_mode in [slider，fp16]"
+        self.quant_mode = quant_mode
+
+        assert self.quant_mode in ["slider", "catq", "lora_only", "fp16"]
         self.finished_quant = False
         self.revocer_act = False
 
@@ -382,7 +383,7 @@ class QuantLlamaDecoderLayer(nn.Module):
 
     def update_quant_mode(self,new_mode,args=None):
         self.quant_mode = new_mode
-        support_list =  ["weight_merge","slider","lora_only","fp16"]
+        support_list = ["weight_merge", "slider", "catq", "lora_only", "fp16"]
         assert self.quant_mode in support_list,f"only supprot quant_mode in {support_list}"
 
         if self.quant_mode == "fp16":
@@ -404,19 +405,25 @@ class QuantLlamaDecoderLayer(nn.Module):
                         if hasattr(module,"use_temporary_parameter"):
                             module.use_temporary_parameter=False
                         if isinstance(module, LoRAQuantLinear):
-                            module.merged = True
-                            # import ipdb;ipdb.set_trace()
-
-                            if args.lora_rank > 0 :
-                                for i in range(module.lora_iter_num):
-                                    if args.export_model_path and args.export_model_mode =="fp16":
-                                        module.weight = module.weight + module.lora_B[i] @ module.lora_A[i] * module.scaling
-                                    else:
-                                        module.weight = module.weight_quantizer(module.weight + module.lora_B[i] @ module.lora_A[i] * module.scaling)
+                            if args.quant_mode_layer_list[self.layer_id] == "catq":
+                                module.materialize_weight()
+                            elif args.lora_rank > 0:
+                                adapted_weight = module.adapted_weight()
+                                if args.export_model_path and args.export_model_mode =="fp16":
+                                    module.weight.copy_(adapted_weight)
+                                else:
+                                    module.weight.copy_(
+                                        module.weight_quantizer(adapted_weight)
+                                    )
                             else:
-                                module.weight = module.weight_quantizer(module.weight)
+                                module.weight.copy_(
+                                    module.weight_quantizer(module.weight)
+                                )
+                            module.merged = True
                         elif isinstance(module, QuantLinear):
-                            if args.export_model_path and args.export_model_mode =="fp16":
+                            if args.quant_mode_layer_list[self.layer_id] == "catq":
+                                module.materialize_weight()
+                            elif args.export_model_path and args.export_model_mode =="fp16":
                                 module.weight = module.weight
                             else:
                                 module.weight = module.weight_quantizer(module.weight)
@@ -463,12 +470,14 @@ class QuantLlamaDecoderLayer(nn.Module):
 
 
 
-        if not (self.quant_mode in ["fp16","weight_merge","lora_only"]):
+        if not (self.quant_mode in ["fp16", "weight_merge", "lora_only"]):
             if self.quant_mode in ["slider"]:
                 self.smooth_and_quant_temporary()
+            elif self.quant_mode == "catq":
+                self.clear_temp_variable()
             else:
-                raise NotImplementedError("only supprot quant_mode in [slider,lora_only,weight_merge,fp16]")
-        
+                raise NotImplementedError(self.quant_mode)
+
 
         residual = hidden_states
 
@@ -514,12 +523,9 @@ class QuantLlamaDecoderLayer(nn.Module):
         if self.eval_mode:
             self.clear_temp_variable()
 
-        if output_attentions:
-            outputs += (self_attn_weights,)
-
         if output_router_logits:
             outputs += (router_logits,)
-        return outputs        
+        return outputs
 
     def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False, quant_rate:float = 1.0):
         # setting weight quantization here does not affect actual forward pass
@@ -531,7 +537,32 @@ class QuantLlamaDecoderLayer(nn.Module):
             if isinstance(m, (QuantLinear, QuantMatMul)):
                 names.append(name)
                 m.set_quant_state(weight_quant, act_quant, quant_rate)
-      
+
+    def set_catq_progress(self, progress: float):
+        for module in self.modules():
+            if isinstance(module, QuantLinear):
+                module.set_catq_progress(progress)
+
+    @torch.no_grad()
+    def catq_statistics(self):
+        statistics = {}
+        for name, module in self.named_modules():
+            quantizer = getattr(module, "weight_quantizer", None)
+            if isinstance(quantizer, CATQQuantizer):
+                weight = (
+                    module.adapted_weight()
+                    if isinstance(module, LoRAQuantLinear)
+                    else module.weight
+                )
+                mu, alpha, threshold = quantizer.factors(weight)
+                statistics[name] = {
+                    **quantizer.occupancy(weight),
+                    "mu_mean": mu.mean().item(),
+                    "alpha_mean": alpha.mean().item(),
+                    "threshold_mean": threshold.mean().item(),
+                }
+        return statistics
+
     def smooth_and_quant_temporary(self):
         with torch.no_grad():
             for name, module in self.named_parameters():
