@@ -1,0 +1,30 @@
+factor_parameterization: bittern_sigmoid
+hard_stage_gradient: last_soft_surrogate
+training_recipe: scaleq_ayot_with_released_catq_refinement
+loss_function: huber
+learnable_factor_lr: 0.0015
+gradient_clip: 1.0
+lora_rank: 64
+lora_lr: 0.0003
+auto_lr_scale: false
+activation_cache: fp32
+batch_size_semantics: per_rank
+per_rank_batch_size: 3
+window_schedule: fill4_window4_stride2
+padding: right
+padding_loss: masked
+omnimath_scoring: judge_pending
+evalplus_execution: samples_only_requires_isolated_runner
+quantized_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+excluded_modules:
+  - embeddings
+  - norms
+  - lm_head
+  - moe_router

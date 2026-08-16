@@ -1,0 +1,61 @@
+model: Qwen/Qwen3-1.7B
+model_revision: 70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+net: qwen3
+attn_implementation: eager
+
+quant_mode: catq
+wbits: 1
+abits: 16
+group_size: 128
+init_round_thd: 0.5
+progressive_ratio: 0.8
+s0: 30.0
+
+calib_dataset: ayot
+calib_manifest: artifacts/calibration/v1/manifest.json
+nsamples: 2048
+seqlen: 2048
+seed: 2
+
+epochs: 60
+batch_size: 3
+inference_batch_size: 3
+learnable_factor_lr: 0.0015
+lora_lr: 0.0003
+auto_lr_scale: false
+warmup_ratio: 0.0
+use_lr_scheduler: true
+grad_clip: 1.0
+loss_function: huber
+huber_loss_max: 1.0
+
+num_layer: 4
+sliding_layer: 2
+fill_window_size: 4
+quant_step: 1
+quant_rate_list: [1.0]
+
+use_lora: true
+lora_rank: 64
+lora_quant: true
+let: false
+lwc: false
+scale_lr: 0.0
+lwc_lr: 0.0
+use_down_scale: false
+
+use_bfloat16: true
+fp16_act: false
+low_memory: true
+low_cpu_memory: false
+use_ddp: true
+
+use_fp_inp_loss: false
+use_quant_tar_loss: false
+use_base_loss: last
+last_round_inp_num: 1
+loss_type: mean
+
+tasks: ""
+eval_ppl: false
+output_dir: artifacts/runs/full-v1

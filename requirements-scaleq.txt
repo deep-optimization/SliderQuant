@@ -1,0 +1,13 @@
+accelerate>=1.0.0
+datasets==2.21.0
+einops>=0.8.0
+evalplus==0.3.1
+huggingface_hub==0.32.4
+numpy>=1.26.0
+pyarrow==20.0.0
+pyyaml>=6.0
+safetensors>=0.4.0
+sentencepiece>=0.2.0
+termcolor>=2.4.0
+tqdm>=4.66.0
+transformers==4.51.0
