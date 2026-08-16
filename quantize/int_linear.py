@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from quantize.catq import CATQQuantizer
 from quantize.quantizer import UniformAffineQuantizer
 
 
@@ -35,9 +36,20 @@ class QuantLinear(nn.Module):
         self.use_weight_quant = False
         self.use_act_quant = False
         self.quant_rate = 1.0
-        # import ipdb;ipdb.set_trace()
-        # initialize quantizer
-        if weight_quant_params["n_bits"] > 1:
+        quant_mode = weight_quant_params.get("quant_mode")
+        if quant_mode == "catq":
+            self.weight_quantizer = CATQQuantizer(
+                org_module.weight,
+                group_size=weight_quant_params["group_size"],
+                init_round_thd=weight_quant_params["init_round_thd"],
+                progressive_ratio=weight_quant_params["progressive_ratio"],
+                s0=weight_quant_params["s0"],
+            )
+            if not disable_input_quant and act_quant_params["n_bits"] < 16:
+                self.act_quantizer = UniformAffineQuantizer(**act_quant_params)
+            else:
+                self.act_quantizer = None
+        elif weight_quant_params["n_bits"] > 1:
             self.weight_quantizer = UniformAffineQuantizer(**weight_quant_params,shape=org_module.weight.shape,is_weight_quant=True)
             if not disable_input_quant:
                 self.act_quantizer = UniformAffineQuantizer(**act_quant_params)
@@ -72,5 +84,12 @@ class QuantLinear(nn.Module):
         self.use_act_quant = act_quant
         self.quant_rate = quant_rate
 
+    def set_catq_progress(self, progress: float):
+        if isinstance(self.weight_quantizer, CATQQuantizer):
+            self.weight_quantizer.set_progress(progress)
 
+    @torch.no_grad()
+    def materialize_weight(self):
+        if isinstance(self.weight_quantizer, CATQQuantizer):
+            self.weight.copy_(self.weight_quantizer.materialize(self.weight))
 

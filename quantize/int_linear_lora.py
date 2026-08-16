@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch
 import torch.nn as nn
 
+from quantize.catq import CATQQuantizer
 from quantize.int_linear import QuantLinear
 
 
@@ -77,8 +78,31 @@ class LoRAQuantLinear(QuantLinear, LoRALayer):
 
         if self.r >0 :  #sign_lora is in weight_quantizer
             out_features, in_features = self.weight.shape
-            self.lora_A = nn.ParameterList([nn.Parameter(self.weight.new_zeros((r, in_features))) for _ in range(self.lora_iter_num)])
-            self.lora_B = nn.ParameterList([nn.Parameter(self.weight.new_zeros((out_features, r))) for _ in range(self.lora_iter_num)])
+            lora_dtype = (
+                torch.float32
+                if isinstance(self.weight_quantizer, CATQQuantizer)
+                else self.weight.dtype
+            )
+            self.lora_A = nn.ParameterList([
+                nn.Parameter(
+                    torch.zeros(
+                        (r, in_features),
+                        device=self.weight.device,
+                        dtype=lora_dtype,
+                    )
+                )
+                for _ in range(self.lora_iter_num)
+            ])
+            self.lora_B = nn.ParameterList([
+                nn.Parameter(
+                    torch.zeros(
+                        (out_features, r),
+                        device=self.weight.device,
+                        dtype=lora_dtype,
+                    )
+                )
+                for _ in range(self.lora_iter_num)
+            ])
             self.scaling = self.lora_alpha / r
             
         
@@ -98,6 +122,24 @@ class LoRAQuantLinear(QuantLinear, LoRALayer):
                 nn.init.kaiming_uniform_(self.lora_A[i], a=math.sqrt(5))
                 nn.init.zeros_(self.lora_B[i])
 
+    def adapted_weight(self, weight=None):
+        adapted = self.weight if weight is None else weight
+        if self.r > 0:
+            for index in range(self.lora_iter_num):
+                adapted = (
+                    adapted
+                    + self.lora_B[index] @ self.lora_A[index] * self.scaling
+                )
+        return adapted
+
+    @torch.no_grad()
+    def materialize_weight(self):
+        if isinstance(self.weight_quantizer, CATQQuantizer):
+            self.weight.copy_(
+                self.weight_quantizer.materialize(self.adapted_weight())
+            )
+            self.merged = True
+
     def forward(self, input: torch.Tensor):
         if self.use_temporary_parameter:
             weight = self.temp_weight
@@ -115,10 +157,10 @@ class LoRAQuantLinear(QuantLinear, LoRALayer):
             weight = weight
         else:
             if self.use_temporary_parameter or self.use_weight_quant:
-                if self.r > 0:
-                    weight = self.weight_quantizer(weight + self.lora_B[0] @ self.lora_A[0] * self.scaling, self.quant_rate)
-                else:
-                    weight = self.weight_quantizer(weight, self.quant_rate)
+                weight = self.weight_quantizer(
+                    self.adapted_weight(weight),
+                    self.quant_rate,
+                )
             else:
                 weight = weight
 
