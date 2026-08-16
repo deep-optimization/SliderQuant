@@ -1,0 +1,53 @@
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: __SCALEQ_JOB_NAME__
+  namespace: __SCALEQ_NAMESPACE__
+spec:
+  minAvailable: 1
+  queue: __SCALEQ_QUEUE__
+  schedulerName: volcano
+  priorityClassName: __SCALEQ_PRIORITY_CLASS__
+  plugins:
+    svc: []
+    ssh: []
+  tasks:
+    - name: worker
+      replicas: 1
+      template:
+        metadata:
+          labels:
+            app: __SCALEQ_JOB_NAME__
+        spec:
+          restartPolicy: Never
+          priorityClassName: __SCALEQ_PRIORITY_CLASS__
+          activeDeadlineSeconds: __SCALEQ_DEADLINE_SECONDS__
+          tolerations:
+            - effect: NoSchedule
+              key: nvidia.com/gpu
+              operator: Exists
+          containers:
+            - name: worker
+              image: __SCALEQ_CONTAINER_IMAGE__
+              command: [/bin/bash, -lc, "exit 1"]
+              env:
+                - name: SCALEQ_SHA
+                  value: __SCALEQ_SHA__
+                - name: SCALEQ_CODE_SHA
+                  value: __SCALEQ_CODE_SHA__
+                - name: SCALEQ_ROOT
+                  value: __SCALEQ_ROOT__
+              resources: {}
+              volumeMounts:
+                - mountPath: /dev/shm
+                  name: dshm
+                - mountPath: __SCALEQ_MOUNT_PATH__
+                  name: artifacts
+          volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: __SCALEQ_SHM_SIZE__
+            - name: artifacts
+              persistentVolumeClaim:
+                claimName: __SCALEQ_PVC__
